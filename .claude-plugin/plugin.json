@@ -1,0 +1,11 @@
+{
+  "name": "cmux-todos",
+  "description": "Each Claude Code session publishes its TODO list to cmux's workspace checklist; a board shows every session's list in one place.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Takuto Lehr"
+  },
+  "homepage": "https://github.com/takutolehr/cmux-todos",
+  "repository": "https://github.com/takutolehr/cmux-todos",
+  "keywords": ["cmux", "todo", "tasks", "sidebar"]
+}

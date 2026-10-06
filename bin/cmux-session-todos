@@ -1,0 +1,870 @@
+#!/usr/bin/env python3
+"""Share TODO lists between Claude Code sessions, you, and cmux.
+
+    cmux-session-todos set ITEM...            replace this session's items
+    cmux-session-todos show                   print this session's items
+    cmux-session-todos clear                  remove this session's items
+    cmux-session-todos personal [ACTION ...]  your own list, not tied to any session
+    cmux-session-todos board [--watch SECS]   every list in one place (editable with --watch)
+    cmux-session-todos open                   show the board in this window's Dock
+
+Session items live in cmux's native per-workspace checklist (`cmux todo`)
+with origin=agent, so they show up in the sidebar and the workspace todo pane.
+Items the user added, and items owned by other live sessions in the same
+workspace, are never touched. When the user checks off, rewords, or deletes a
+session's item in cmux, that edit survives the session's next `set`.
+
+The personal list lives in $XDG_DATA_HOME/cmux-session-todos/personal.json
+and shows at the top of the board.
+
+Items are written "[ ] pending", "[>] in progress" or "[x] done". A leading
+"- " is allowed; text without a checkbox is pending.
+"""
+
+import argparse
+import codecs
+import fcntl
+import json
+import os
+import re
+import select
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+from contextlib import contextmanager
+from pathlib import Path
+from typing import NamedTuple
+
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "cmux-session-todos"
+SESSIONS_DIR = STATE_DIR / "sessions"
+PERSONAL_FILE = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "cmux-session-todos" / "personal.json"
+CMUX = os.environ.get("CMUX_BUNDLED_CLI_PATH") or shutil.which("cmux") or "cmux"
+MAX_ITEMS = 50  # cmux caps each workspace checklist at 50 items
+
+LINE_RE = re.compile(r"^(?:[-*]\s+)?\[(?P<mark>[ xX>~])\]\s+(?P<text>.+)$")
+MARK_TO_STATE = {" ": "pending", "x": "completed", "X": "completed", ">": "in-progress", "~": "in-progress"}
+STATE_TO_MARK = {"pending": " ", "completed": "x", "in-progress": ">"}
+STATE_COMMAND = {"pending": "uncheck", "completed": "check", "in-progress": "start"}
+STATE_CHANGE = {"pending": "reopened", "completed": "checked off", "in-progress": "started"}
+
+
+class TodoError(Exception):
+    pass
+
+
+def die(message):
+    print(f"cmux-session-todos: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def cmux(*args, stdin=None):
+    env = {**os.environ, "CMUX_QUIET": "1"}
+    try:
+        proc = subprocess.run([CMUX, *args], input=stdin, capture_output=True, text=True, env=env, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise TodoError(f"could not run cmux: {exc}") from exc
+    if proc.returncode != 0:
+        raise TodoError((proc.stderr or proc.stdout).strip() or f"`cmux {args[0]}` failed")
+    return proc.stdout
+
+
+def cmux_json(*args):
+    return json.loads(cmux(*args, "--json"))
+
+
+def list_items(workspace):
+    return cmux_json("todo", "list", "--workspace", workspace)["items"]
+
+
+@contextmanager
+def locked():
+    """Serialize read-modify-write of checklists across sessions and the board."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(STATE_DIR / ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+# --- session state ---------------------------------------------------------
+
+
+def session_context():
+    workspace = os.environ.get("CMUX_WORKSPACE_ID")
+    session = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not workspace:
+        die("not running inside a cmux terminal (CMUX_WORKSPACE_ID is unset)")
+    if not session:
+        die("CLAUDE_CODE_SESSION_ID is unset; run this from a Claude Code session")
+    pid = os.environ.get("CLAUDE_PID") or os.environ.get("CMUX_CLAUDE_PID")
+    return {
+        "session_id": session,
+        "workspace_id": workspace,
+        "surface_id": os.environ.get("CMUX_SURFACE_ID"),
+        "pid": int(pid) if pid and pid.isdigit() else None,
+    }
+
+
+def pid_alive(pid):
+    if not pid:
+        return True  # unknown owner: assume alive so its items are left alone
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def load_states():
+    states = {}
+    for path in SESSIONS_DIR.glob("*.json"):
+        try:
+            state = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        states[state.get("session_id") or path.stem] = state
+    return states
+
+
+def state_path(session_id):
+    return SESSIONS_DIR / f"{session_id}.json"
+
+
+def ownership(ctx, states):
+    """Return (sent, dismissed, takeover) for this session.
+
+    `sent` maps each item id the session owns to the text and state it last
+    sent for that item. A session restarted in the same terminal gets a new
+    session id; its predecessor's items are inherited instead of left behind
+    as duplicates.
+    """
+    own = states.get(ctx["session_id"], {})
+    sent = {record["id"]: record for record in own.get("items", [])}
+    dismissed = set(own.get("dismissed", []))
+    takeover = []
+    for sid, state in states.items():
+        if sid == ctx["session_id"] or state.get("workspace_id") != ctx["workspace_id"]:
+            continue
+        if state.get("surface_id") == ctx["surface_id"] and not pid_alive(state.get("pid")):
+            sent.update({record["id"]: record for record in state.get("items", [])})
+            takeover.append(sid)
+    return sent, dismissed, takeover
+
+
+def write_checklist(ctx, wanted):
+    """Replace this session's items with `wanted` [(text, state)], keeping the user's edits.
+
+    Per item field, a three-way merge against the last `set`: if the session
+    sends the same value it sent last time, or the user changed the field in
+    cmux since then, cmux's current value wins. So a check-off or rewording
+    the user made in cmux survives until the session deliberately changes
+    that field again. Items the user deleted stay deleted while the session
+    keeps listing them.
+    Returns (this session's items now in cmux, notes describing kept user edits).
+    """
+    workspace = ctx["workspace_id"]
+    with locked():
+        states = load_states()
+        sent, dismissed, takeover = ownership(ctx, states)
+        current = list_items(workspace)
+        present = {item["id"] for item in current}
+        dismissed |= {record["sent_text"] for item_id, record in sent.items() if item_id not in present}
+
+        notes, entries, records = [], [], []
+        unclaimed = [item for item in current if item["id"] in sent]
+        for text, state in wanted:
+            if text in dismissed:
+                notes.append(f"deleted: {text}")
+                continue
+            match = next((item for item in unclaimed if sent[item["id"]]["sent_text"] == text), None) or next(
+                (item for item in unclaimed if item["text"] == text), None
+            )
+            entry = {"text": text, "state": state, "origin": "agent"}
+            if match:
+                unclaimed.remove(match)
+                last = sent[match["id"]]
+                entry["id"] = match["id"]
+                for field, value in (("text", text), ("state", state)):
+                    session_changed = value != last[f"sent_{field}"]
+                    user_changed = match[field] != last.get(f"synced_{field}", last[f"sent_{field}"])
+                    if user_changed or not session_changed:
+                        entry[field] = match[field]
+                if entry["text"] != text:
+                    notes.append(f'reworded: "{text}" -> "{entry["text"]}"')
+                if entry["state"] != state:
+                    notes.append(f"{STATE_CHANGE[entry['state']]}: {entry['text']}")
+            entries.append(entry)
+            records.append({"sent_text": text, "sent_state": state, "synced_text": entry["text"], "synced_state": entry["state"]})
+
+        # Keep everyone else's items in place; put ours where our first item was.
+        payload, kept_ids, inserted = [], set(), False
+        for item in current:
+            if item["id"] in sent:
+                if not inserted:
+                    payload.extend(entries)
+                    inserted = True
+                continue
+            payload.append({"id": item["id"], "text": item["text"], "state": item["state"]})
+            kept_ids.add(item["id"])
+        if not inserted:
+            payload.extend(entries)
+        if len(payload) > MAX_ITEMS:
+            die(f"workspace checklist would have {len(payload)} items; cmux allows {MAX_ITEMS}. Shorten the list.")
+
+        cmux("todo", "set", "--workspace", workspace, stdin=json.dumps(payload))
+        ours = [item for item in list_items(workspace) if item["id"] not in kept_ids]
+
+        # cmux keeps the payload order, so new items get the fresh ids in sequence.
+        reused = {entry["id"] for entry in entries if "id" in entry}
+        fresh = iter([item["id"] for item in ours if item["id"] not in reused])
+        for entry, record in zip(entries, records):
+            record["id"] = entry.get("id") or next(fresh, None)
+        records = [record for record in records if record["id"]]
+        still_dismissed = sorted(dismissed & {text for text, _ in wanted})
+
+        for sid in takeover:
+            state_path(sid).unlink(missing_ok=True)
+        if records or still_dismissed:
+            SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+            state = {**ctx, "cwd": os.getcwd(), "items": records, "dismissed": still_dismissed, "updated_at": time.time()}
+            state_path(ctx["session_id"]).write_text(json.dumps(state, indent=2))
+        else:
+            state_path(ctx["session_id"]).unlink(missing_ok=True)
+        return ours, notes
+
+
+def own_items(ctx):
+    sent, _, _ = ownership(ctx, load_states())
+    return [item for item in list_items(ctx["workspace_id"]) if item["id"] in sent]
+
+
+# --- set / show / clear ----------------------------------------------------
+
+
+def parse_checklist(text):
+    items = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        match = LINE_RE.match(line)
+        if match:
+            items.append((match["text"].strip(), MARK_TO_STATE[match["mark"]]))
+        else:
+            items.append((re.sub(r"^[-*]\s+", "", line), "pending"))
+    return items
+
+
+def format_items(items, numbered=False):
+    lines = [
+        f"{f'{n}. ' if numbered else ''}[{STATE_TO_MARK.get(item['state'], ' ')}] {item['text']}"
+        for n, item in enumerate(items, 1)
+    ]
+    done = sum(item["state"] == "completed" for item in items)
+    return "\n".join(lines + [f"{done}/{len(items)} done"])
+
+
+def cmd_set(args):
+    ctx = session_context()
+    if args.items:
+        text = "\n".join(args.items)
+    elif sys.stdin.isatty():
+        die('pass items as arguments: set "[x] done" "[>] in progress" "[ ] pending"')
+    else:
+        text = sys.stdin.read()
+    wanted = parse_checklist(text)
+    if not wanted:
+        die("empty checklist; use `clear` to remove this session's items")
+    items, notes = write_checklist(ctx, wanted)
+    print(format_items(items))
+    if notes:
+        print("The user changed these in cmux; update your plan to match:")
+        print("\n".join(f"  {note}" for note in notes))
+
+
+def cmd_show(_args):
+    items = own_items(session_context())
+    print(format_items(items) if items else "No items published by this session.")
+
+
+def cmd_clear(_args):
+    write_checklist(session_context(), [])
+    print("Cleared this session's items.")
+
+
+def cmd_hook_session_start(_args):
+    """SessionStart hook: point the agent at the skill when running inside cmux."""
+    if not (os.environ.get("CMUX_WORKSPACE_ID") and os.environ.get("CLAUDE_CODE_SESSION_ID")):
+        return
+    context = (
+        "This Claude Code session runs inside cmux, where the user follows every session's TODO list. "
+        "For any task with 3 or more steps, use the session-todos skill to publish your list and keep it current. "
+        "When the user asks you to add something to their own todo list, the same skill covers their personal list."
+    )
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}}))
+
+
+# --- personal list ---------------------------------------------------------
+
+
+def load_personal():
+    try:
+        return json.loads(PERSONAL_FILE.read_text())["items"]
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError, KeyError) as exc:
+        raise TodoError(f"cannot read {PERSONAL_FILE}: {exc}") from exc
+
+
+def change_personal(action, item_id=None, text=None, state=None, ids=None):
+    with locked():
+        items = load_personal()
+        if action == "add":
+            items.append({"id": str(uuid.uuid4()).upper(), "text": text, "state": state or "pending"})
+        elif action == "clear":
+            items = [] if ids is None else [item for item in items if item["id"] not in ids]
+        else:
+            item = next((item for item in items if item["id"] == item_id), None)
+            if item is None:
+                raise TodoError("that item is no longer on the personal list")
+            if action == "rm":
+                items.remove(item)
+            elif action == "edit":
+                item["text"] = text
+            else:
+                item["state"] = state
+        PERSONAL_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PERSONAL_FILE.write_text(json.dumps({"items": items}, indent=2) + "\n")
+
+
+def cmd_personal(args):
+    action = args.action or "list"
+    if action == "add":
+        change_personal("add", text=" ".join(args.text))
+    elif action == "clear":
+        change_personal("clear")
+    elif action != "list":
+        items = load_personal()
+        if not 1 <= args.index <= len(items):
+            die(f"no item {args.index}; the personal list has {len(items)}")
+        item_id = items[args.index - 1]["id"]
+        if action in ("rm", "edit"):
+            change_personal(action, item_id, text=" ".join(getattr(args, "text", [])))
+        else:
+            change_personal("state", item_id, state={"check": "completed", "uncheck": "pending", "start": "in-progress"}[action])
+    items = load_personal()
+    print(format_items(items, numbered=True) if items else "The personal list is empty.")
+
+
+# --- board -----------------------------------------------------------------
+
+GLYPH = {"completed": "✓", "in-progress": "▶", "pending": "○"}
+COLOR = {"completed": "\x1b[2;32m", "in-progress": "\x1b[33m", "pending": ""}
+BOLD, DIM, CYAN, RED, REVERSE, RESET = "\x1b[1m", "\x1b[2m", "\x1b[36m", "\x1b[31m", "\x1b[7m", "\x1b[0m"
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+BOARD_KEYS = "space done  a add  e edit  d del  s start  ⏎ go  q quit"
+
+
+class Row(NamedTuple):
+    line: str
+    key: tuple = None  # ("section", id) or ("item", id) for selectable rows
+    section: dict = None
+    item: dict = None
+
+
+def sidebar_order(window_id):
+    """A window's cmux ref (like "window:1") and its workspaces in sidebar order, each paired
+    with its workspace group (or None). A group's members are listed together where the
+    group first appears.
+    """
+    listing = cmux_json("workspace", "list", "--window", window_id)
+    workspaces = listing["workspaces"]
+    groups = cmux_json("workspace-group", "list", "--window", window_id).get("groups", [])
+    group_of = {ref: group for group in groups for ref in group["member_workspace_refs"]}
+    by_ref = {ws["ref"]: ws for ws in workspaces}
+    ordered, placed = [], set()
+    for ws in workspaces:
+        group = group_of.get(ws["ref"])
+        members = [by_ref[ref] for ref in group["member_workspace_refs"] if ref in by_ref] if group else [ws]
+        for member in members:
+            if member["ref"] not in placed:
+                placed.add(member["ref"])
+                ordered.append((member, group))
+    return listing.get("window_ref") or "", ordered
+
+
+def running_sessions():
+    """Claude session ids whose process cmux's agent hooks report as alive, or None if unknown.
+
+    More reliable than the pid recorded at the last `set`: cmux resumes sessions
+    under a new pid after a restart or hibernation.
+    """
+    try:
+        records = cmux_json("sessions", "--agent", "claude")["sessions"]
+    except (TodoError, ValueError, KeyError):
+        return None
+    return {record["session_id"] for record in records if record.get("stored_pid_exists")}
+
+
+def collect_board():
+    """The personal list, then every workspace in every window with its checklist grouped by owner."""
+    running = running_sessions()
+    owners = {}
+    for sid, state in load_states().items():
+        alive = sid in running if running is not None else pid_alive(state.get("pid"))
+        for record in state.get("items", []):
+            owners[record["id"]] = f"session {sid[:8]}" + ("" if alive else " (ended)")
+    personal = load_personal()
+    sections = [{"key": "personal", "title": "Personal", "workspace": None, "selected": False, "items": personal, "owners": {"": personal}}]
+    windows = [(window, *sidebar_order(window["id"])) for window in cmux_json("list-windows")]
+    # Label and order windows by cmux's own ref ("window:1"), not by list position.
+    number = lambda ref: int(ref.rpartition(":")[2]) if ref.rpartition(":")[2].isdigit() else 0
+    windows.sort(key=lambda entry: number(entry[1]))
+    for window, window_ref, ordered in windows:
+        for ws, group in ordered:
+            items = list_items(ws["id"])
+            by_owner = {}
+            for item in items:
+                owner = owners.get(item["id"]) or ("agent" if item.get("origin") == "agent" else "you")
+                by_owner.setdefault(owner, []).append(item)
+            # cmux moves items as they are checked, so order by owner, not by first item.
+            by_owner = dict(sorted(by_owner.items(), key=lambda entry: ({"agent": 1, "you": 2}.get(entry[0], 0), entry[0])))
+            sections.append({
+                "key": ws["id"],
+                "title": ws.get("title") or ws.get("ref"),
+                "workspace": ws["id"],
+                "selected": ws.get("selected", False) and window.get("key", False),
+                "items": items,
+                "owners": by_owner,
+                "window": f"Window {number(window_ref)}" if len(windows) > 1 else None,
+                "group": group and {"key": group["ref"], "name": group["name"], "anchor": group["anchor_workspace_ref"] == ws["ref"]},
+            })
+    return sections
+
+
+def fit(text, width):
+    return text if len(text) <= width else text[: max(width - 1, 0)] + "…"
+
+
+def heading(text, items, width, style):
+    """`text` on the left, a done/total count for `items` on the right."""
+    done = sum(item["state"] == "completed" for item in items)
+    progress = f"{done}/{len(items)}" if items else ""
+    text = fit(text, width - len(progress) - 1)
+    return f"{style}{text}{RESET}{' ' * (width - len(text) - len(progress))}{DIM}{progress}{RESET}"
+
+
+def board_rows(sections, width, hide_done=False, show_empty=False, interactive=False):
+    """Lay the board out like the cmux sidebar: window, then workspace group, then workspace."""
+    rows = []
+    shown = [s for s in sections if s["items"] or show_empty or (interactive and s["workspace"] is None)]
+    idle = sum(1 for s in sections if s["workspace"] and not s["items"] and not show_empty)
+    window, group_key = None, None
+    for section in shown:
+        if section.get("window") != window:
+            window, group_key = section.get("window"), None
+            rows.append(Row(f"{DIM}{f'── {window} '.ljust(width, '─')}{RESET}"))
+        group = section.get("group")
+        indent = "  " if group else ""
+        style = BOLD + (CYAN if section["selected"] else "")
+        own_heading = Row(indent + heading(section["title"], section["items"], width - len(indent), style), ("section", section["key"]), section)
+        if group and group["key"] != group_key:
+            members = [s for s in shown if (s.get("group") or {}).get("key") == group["key"]]
+            group_line = heading(f"▾ {group['name']}", [i for s in members for i in s["items"]], width, style if group["anchor"] else BOLD)
+            if group["anchor"]:
+                # As in the cmux sidebar, the group header is the anchor workspace's own row.
+                own_heading = Row(group_line, ("section", section["key"]), section)
+            else:
+                rows.append(Row(group_line))
+        group_key = group and group["key"]
+        rows.append(own_heading)
+        if not section["items"]:
+            rows.append(Row(f"{indent}  {DIM}nothing here{' · a to add' if interactive else ''}{RESET}"))
+        multiple = len(section["owners"]) > 1
+        for owner, items in section["owners"].items():
+            if multiple:
+                rows.append(Row(f"{indent}  {DIM}{owner}{RESET}"))
+            visible = [item for item in items if not (hide_done and item["state"] == "completed")]
+            for item in visible:
+                state = item["state"]
+                text = fit(item["text"], width - len(indent) - 4)
+                rows.append(Row(f"{indent}  {COLOR.get(state, '')}{GLYPH.get(state, '○')} {text}{RESET}", ("item", item["id"]), section, item))
+            if len(visible) < len(items):
+                rows.append(Row(f"{indent}  {DIM}{len(items) - len(visible)} done{RESET}"))
+        rows.append(Row(""))
+    if idle:
+        hint = " · w to show" if interactive else ""
+        rows.append(Row(f"{DIM}{idle} workspace{'s' if idle != 1 else ''} without todos{hint}{RESET}"))
+    elif not shown:
+        rows.append(Row(f"{DIM}Nothing on the board yet.{RESET}"))
+    return rows
+
+
+def change_item(section, action, item=None, text=None, state=None):
+    """Apply one manual edit to a workspace checklist or the personal list."""
+    if section["workspace"] is None:
+        change_personal(action, item and item["id"], text=text, state=state)
+        return
+    workspace = section["workspace"]
+    with locked():
+        if action == "add":
+            cmux("todo", "add", text, "--workspace", workspace)
+        elif action == "edit":
+            cmux("todo", "edit", item["id"], text, "--workspace", workspace)
+        elif action == "rm":
+            cmux("todo", "rm", item["id"], "--workspace", workspace)
+        else:
+            cmux("todo", STATE_COMMAND[state], item["id"], "--workspace", workspace)
+
+
+def clear_section(section):
+    """Delete every item the board shows in a list. Items added since the last refresh stay."""
+    ids = {item["id"] for item in section["items"]}
+    if section["workspace"] is None:
+        change_personal("clear", ids=ids)
+        return
+    workspace = section["workspace"]
+    with locked():
+        kept = [{"id": item["id"], "text": item["text"], "state": item["state"]} for item in list_items(workspace) if item["id"] not in ids]
+        cmux("todo", "set", "--workspace", workspace, stdin=json.dumps(kept))
+
+
+class BoardTUI:
+    """Full-screen board. Refreshes every `interval` seconds; keys edit the selected item."""
+
+    def __init__(self, interval, hide_done):
+        self.interval = interval
+        self.hide_done = hide_done
+        self.show_empty = False
+        self.sections = []
+        self.rows = []
+        self.cursor = None  # key of the selected row; survives refreshes and reordering
+        self.cursor_index = 0
+        self.offset = 0
+        self.message = ""
+        self.next_refresh = 0.0
+        self.fd = sys.stdin.fileno()
+        self.interactive = sys.stdin.isatty()
+        self.saved = None
+
+    def run(self):
+        import termios
+        import tty
+
+        if self.interactive:
+            self.saved = termios.tcgetattr(self.fd)
+            record_board()
+        sys.stdout.write("\x1b[?1049h\x1b[?25l")  # alternate screen, hide cursor
+        try:
+            if self.interactive:
+                tty.setcbreak(self.fd)
+            while True:
+                if time.monotonic() >= self.next_refresh:
+                    self.refresh()
+                self.draw()
+                key = self.read_key(max(self.next_refresh - time.monotonic(), 0))
+                if key == "q":
+                    break
+                if key:
+                    self.handle(key)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            if self.saved is not None:
+                termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+            sys.stdout.write("\x1b[?25h\x1b[?1049l")
+            sys.stdout.flush()
+
+    def refresh(self):
+        try:
+            self.sections = collect_board()
+        except (TodoError, ValueError, KeyError) as exc:
+            self.message = f"{RED}{exc}{RESET}"
+        self.next_refresh = time.monotonic() + self.interval
+
+    def draw(self):
+        size = shutil.get_terminal_size()
+        # Leave the last column empty: a full-width line puts the cursor in the
+        # pending-wrap state, where the trailing erase-line clears the last character.
+        width = size.columns - 1
+        self.rows = board_rows(self.sections, width, self.hide_done, self.show_empty, self.interactive)
+        keys = [row.key for row in self.rows if row.key]
+        if self.cursor in keys:
+            self.cursor_index = keys.index(self.cursor)
+        elif keys:
+            self.cursor_index = min(self.cursor_index, len(keys) - 1)
+            self.cursor = keys[self.cursor_index]
+        else:
+            self.cursor = None
+
+        body = max(size.lines - 3, 1)  # title, blank line, footer
+        index = next((i for i, row in enumerate(self.rows) if row.key == self.cursor), 0)
+        if index < self.offset:
+            self.offset = index
+        elif index >= self.offset + body:
+            self.offset = index - body + 1
+        self.offset = max(0, min(self.offset, len(self.rows) - body))
+
+        clock = time.strftime("%H:%M:%S")
+        lines = [f"{BOLD}Session todos{RESET}" + " " * max(width - 13 - len(clock), 1) + f"{DIM}{clock}{RESET}", ""]
+        for row in self.rows[self.offset : self.offset + body]:
+            if self.interactive and row.key and row.key == self.cursor:
+                padding = " " * max(width - len(ANSI_RE.sub("", row.line)), 0)
+                lines.append(REVERSE + row.line.replace(RESET, RESET + REVERSE) + padding + RESET)
+            else:
+                lines.append(row.line)
+        out = "\x1b[H" + "".join(line + "\x1b[K\n" for line in lines) + "\x1b[J"
+        footer = self.message or (f"{DIM}{fit(BOARD_KEYS, width)}{RESET}" if self.interactive else "")
+        out += f"\x1b[{size.lines};1H{footer}\x1b[K"
+        self.message = ""
+        sys.stdout.write(out)
+        sys.stdout.flush()
+
+    def read_key(self, timeout):
+        if not self.interactive:
+            time.sleep(timeout)
+            return None
+        if not select.select([self.fd], [], [], timeout)[0]:
+            return None
+        key = os.read(self.fd, 1).decode(errors="ignore")
+        if key != "\x1b":
+            return key
+        sequence = ""
+        while len(sequence) < 2 and select.select([self.fd], [], [], 0.02)[0]:
+            sequence += os.read(self.fd, 1).decode(errors="ignore")
+        return {"[A": "up", "OA": "up", "[B": "down", "OB": "down"}.get(sequence)
+
+    def prompt(self, label, initial=""):
+        """Read a line on the bottom row. Enter accepts; Esc, Ctrl-C or an empty line cancels.
+
+        A minimal editor (Backspace, Ctrl-U, Ctrl-W) instead of input(), because
+        macOS's libedit-backed readline ignores pre-filled text.
+        """
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="ignore")
+        text = initial
+        sys.stdout.write("\x1b[?25h")
+        try:
+            while True:
+                size = shutil.get_terminal_size()
+                visible = text[-max(size.columns - len(label) - 2, 1) :]
+                sys.stdout.write(f"\x1b[{size.lines};1H\x1b[K{label}{visible}")
+                sys.stdout.flush()
+                select.select([self.fd], [], [])
+                chunk = decoder.decode(os.read(self.fd, 64))
+                i = 0
+                while i < len(chunk):
+                    char = chunk[i]
+                    if char == "\x1b":
+                        if i == len(chunk) - 1:
+                            if not select.select([self.fd], [], [], 0.02)[0]:
+                                return ""  # a bare Esc
+                            chunk += decoder.decode(os.read(self.fd, 64))
+                        i += 1  # skip an escape sequence such as an arrow key
+                        if i < len(chunk) and chunk[i] in "[O":
+                            i += 1
+                            while i < len(chunk) and not (chunk[i].isalpha() or chunk[i] == "~"):
+                                i += 1
+                    elif char in "\r\n":
+                        return text.strip()
+                    elif char in "\x7f\x08":
+                        text = text[:-1]
+                    elif char == "\x15":  # Ctrl-U
+                        text = ""
+                    elif char == "\x17":  # Ctrl-W
+                        text = text.rstrip()[: text.rstrip().rfind(" ") + 1]
+                    elif char >= " ":
+                        text += char
+                    i += 1
+        except KeyboardInterrupt:
+            return ""
+        finally:
+            sys.stdout.write("\x1b[?25l")
+
+    def move(self, step):
+        keys = [row.key for row in self.rows if row.key]
+        if keys:
+            self.cursor_index = max(0, min(self.cursor_index + step, len(keys) - 1))
+            self.cursor = keys[self.cursor_index]
+
+    def handle(self, key):
+        if key in ("up", "k", "down", "j"):
+            self.move(-1 if key in ("up", "k") else 1)
+            return
+        if key in ("c", "w"):
+            if key == "c":
+                self.hide_done = not self.hide_done
+            else:
+                self.show_empty = not self.show_empty
+            return
+        row = next((row for row in self.rows if row.key and row.key == self.cursor), None)
+        if row is None:
+            return
+        section, item = row.section, row.item
+        try:
+            if key in ("\r", "\n"):
+                if section["workspace"]:
+                    cmux("select-workspace", "--workspace", section["workspace"])
+                return
+            if key == "a":
+                text = self.prompt(f"Add to {fit(section['title'], 30)}: ")
+                if text:
+                    change_item(section, "add", text=text)
+            elif key == "d" and item is None:
+                count = len(section["items"])
+                label = f'Delete all {count} item{"s" if count != 1 else ""} in "{fit(section["title"], 30)}"? [y/N] '
+                if count and self.prompt(label).lower() == "y":
+                    clear_section(section)
+            elif item is None:
+                return
+            elif key in (" ", "x"):
+                change_item(section, "state", item, state="pending" if item["state"] == "completed" else "completed")
+            elif key == "s":
+                change_item(section, "state", item, state="pending" if item["state"] == "in-progress" else "in-progress")
+            elif key == "e":
+                text = self.prompt("Edit: ", item["text"])
+                if text and text != item["text"]:
+                    change_item(section, "edit", item, text=text)
+            elif key == "d":
+                if self.prompt(f'Delete "{fit(item["text"], 40)}"? [y/N] ').lower() == "y":
+                    change_item(section, "rm", item)
+            else:
+                return
+        except TodoError as exc:
+            self.message = f"{RED}{exc}{RESET}"
+        self.next_refresh = 0.0  # show the edit right away
+
+
+def cmd_board(args):
+    if args.watch:
+        BoardTUI(args.watch, args.hide_done).run()
+        return
+    rows = board_rows(collect_board(), shutil.get_terminal_size().columns - 1, args.hide_done)
+    print("\n".join(row.line for row in rows).rstrip("\n"))
+
+
+BOARDS_DIR = STATE_DIR / "boards"
+SHELLS = {"zsh", "bash", "fish", "sh", "tcsh", "nu", "login"}
+
+
+def record_board():
+    """Note which cmux tab and tty this board runs in, so `open` can find the tab again."""
+    surface = os.environ.get("CMUX_SURFACE_ID")
+    if not (surface and sys.stdin.isatty()):
+        return
+    BOARDS_DIR.mkdir(parents=True, exist_ok=True)
+    record = {"pid": os.getpid(), "tty": os.path.basename(os.ttyname(sys.stdin.fileno()))}
+    (BOARDS_DIR / f"{surface}.json").write_text(json.dumps(record))
+
+
+def board_tab_state(record):
+    """'running', 'idle' (only a shell left on its tty), or None if unknown or busy."""
+    if not record:
+        return None
+    try:
+        os.kill(record["pid"], 0)
+        return "running"
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        return "running"
+    ps = subprocess.run(["ps", "-t", record["tty"], "-o", "comm="], capture_output=True, text=True).stdout.split()
+    names = {os.path.basename(name).lstrip("-") for name in ps}
+    return "idle" if names and names <= SHELLS else None
+
+
+def cmd_open(_args):
+    """Show the board in this window's Dock: reuse its tab, restart the board in it, or add a tab.
+
+    Tabs in the current workspace count too, so a board opened in a split is
+    reused. When the Dock is turned off, the board opens in a split instead.
+    Run from a terminal inside the Dock, that terminal becomes the board.
+    """
+    command = f"{shlex.quote(os.path.realpath(__file__))} board --watch 2"
+    panes = cmux_json("list-panes", "--id-format", "both")["panes"]
+    dock_panes = [pane for pane in panes if pane.get("dock_scope")]
+    tabs = []  # (ref, in_dock, state); Dock tabs first
+    dock_ids = set()
+    for pane in sorted(panes, key=lambda pane: not pane.get("dock_scope")):
+        for surface in cmux_json("list-pane-surfaces", "--pane", pane["ref"], "--id-format", "both")["surfaces"]:
+            if surface.get("type") != "terminal":
+                continue
+            if pane.get("dock_scope"):
+                dock_ids.add(surface["id"])
+            try:
+                record = json.loads((BOARDS_DIR / f"{surface['id']}.json").read_text())
+            except (OSError, ValueError):
+                record = None
+            tabs.append((surface["ref"], bool(pane.get("dock_scope")), board_tab_state(record)))
+
+    running = next((tab for tab in tabs if tab[2] == "running"), None)
+    idle = next((tab for tab in tabs if tab[2] == "idle"), None)
+    if not running and os.environ.get("CMUX_SURFACE_ID") in dock_ids and sys.stdin.isatty():
+        os.execv(sys.executable, [sys.executable, os.path.realpath(__file__), "board", "--watch", "2"])
+    if running:
+        in_dock = running[1]
+        result = f"The board is already open in the {'Dock' if in_dock else 'split next to you'}."
+    elif idle:
+        # The board was quit and its tab is back at a shell prompt: start it there again.
+        cmux("send", "--surface", idle[0], command)
+        cmux("send-key", "--surface", idle[0], "enter")
+        in_dock = idle[1]
+        result = "Restarted the board in its tab."
+    else:
+        target = ["--pane", dock_panes[0]["ref"]] if dock_panes else []
+        try:
+            cmux("new-surface", "--placement", "dock", *target, "--command", command)
+            in_dock = True
+            result = "Opened the board in a new Dock tab."
+        except TodoError as exc:
+            if "dock placement is disabled" not in str(exc).lower():
+                raise
+            cmux("new-pane", "--direction", "right", "--command", command)
+            in_dock = False
+            result = "The cmux Dock is turned off, so the board opened in a split. Turn on Settings > Beta Features > Dock to keep it in the right sidebar."
+    if in_dock:
+        cmux("right-sidebar", "set", "dock", "--no-focus")
+    print(result)
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="cmux-session-todos", description=__doc__.split("\n\n")[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    set_parser = sub.add_parser("set", help="replace this session's items")
+    set_parser.add_argument("items", nargs="*", help='"[ ] pending", "[>] in progress" or "[x] done"; stdin when omitted')
+    set_parser.set_defaults(func=cmd_set)
+    sub.add_parser("show", help="print this session's items").set_defaults(func=cmd_show)
+    sub.add_parser("clear", help="remove this session's items").set_defaults(func=cmd_clear)
+
+    personal = sub.add_parser("personal", help="your own list, not tied to any session")
+    personal.set_defaults(func=cmd_personal)
+    actions = personal.add_subparsers(dest="action")
+    actions.add_parser("list", help="print the list (the default)")
+    actions.add_parser("add", help="add an item").add_argument("text", nargs="+")
+    for name, help_text in (("check", "mark done"), ("uncheck", "mark pending"), ("start", "mark in progress"), ("rm", "remove")):
+        actions.add_parser(name, help=help_text).add_argument("index", type=int, help="1-based number from `personal list`")
+    edit = actions.add_parser("edit", help="reword an item")
+    edit.add_argument("index", type=int)
+    edit.add_argument("text", nargs="+")
+    actions.add_parser("clear", help="remove every item")
+
+    board = sub.add_parser("board", help="show every list across all workspaces")
+    board.add_argument("--watch", type=float, metavar="SECS", help="full-screen, redraw every SECS seconds, edit with keys")
+    board.add_argument("--hide-done", action="store_true", help="collapse completed items")
+    board.set_defaults(func=cmd_board)
+    sub.add_parser("open", help="show the board in this window's Dock, reopening or restarting it if needed").set_defaults(func=cmd_open)
+    sub.add_parser("hook-session-start", help=argparse.SUPPRESS).set_defaults(func=cmd_hook_session_start)
+
+    args = parser.parse_args()
+    try:
+        args.func(args)
+    except TodoError as exc:
+        die(str(exc))
+
+
+if __name__ == "__main__":
+    main()

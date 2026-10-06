@@ -1,0 +1,14 @@
+{
+  "name": "cmux-todos",
+  "description": "Marketplace for the cmux-todos plugin.",
+  "owner": {
+    "name": "Takuto Lehr"
+  },
+  "plugins": [
+    {
+      "name": "cmux-todos",
+      "source": "./",
+      "description": "Each Claude Code session publishes its TODO list to cmux's workspace checklist; a board shows every session's list in one place."
+    }
+  ]
+}
