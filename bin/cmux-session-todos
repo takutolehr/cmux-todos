@@ -545,6 +545,7 @@ class BoardTUI:
         self.cursor = None  # key of the selected row; survives refreshes and reordering
         self.cursor_index = 0
         self.offset = 0
+        self.heading_to_top = False  # set by a Tab jump: scroll so the list shows below its heading
         self.message = ""
         self.next_refresh = 0.0
         self.fd = sys.stdin.fileno()
@@ -603,7 +604,12 @@ class BoardTUI:
 
         body = max(size.lines - 3, 1)  # title, blank line, footer
         index = next((i for i, row in enumerate(self.rows) if row.key == self.cursor), 0)
-        if index < self.offset:
+        if self.heading_to_top:
+            self.heading_to_top = False
+            self.offset = index
+            while self.offset > 0 and not self.rows[self.offset - 1].key and self.rows[self.offset - 1].line:
+                self.offset -= 1  # keep a group or window title above its first heading
+        elif index < self.offset:
             self.offset = index
         elif index >= self.offset + body:
             self.offset = index - body + 1
@@ -701,6 +707,7 @@ class BoardTUI:
         else:
             self.cursor_index = next((i for i in reversed(headings) if i < self.cursor_index), headings[-1])
         self.cursor = keys[self.cursor_index]
+        self.heading_to_top = True
 
     def handle(self, key):
         if key in ("up", "k", "down", "j"):
@@ -748,7 +755,7 @@ class BoardTUI:
                     change_item(section, "rm", item)
             else:
                 return
-        except TodoError as exc:
+        except (TodoError, ValueError, KeyError, OSError) as exc:
             self.message = f"{RED}{exc}{RESET}"
         self.next_refresh = 0.0  # show the edit right away
 
