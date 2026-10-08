@@ -16,11 +16,12 @@ Personal                                                   1/2
   ▶ Cover the timeout path with tests
   ○ Update the client README
 
-▾ Website launch                                           1/3
-  ✳ Point the domain at the new host                       1/3
+▾ Website launch                                           1/4
+  ✳ Point the domain at the new host                       1/4
     session 9b21c0de
     ✓ Add the DNS records
-    ▶ Wait for the certificate
+    ? You: Decide whether www redirects to the bare domain
+    ○ Wait for the certificate
     you
     ○ Tell marketing the site is live
 
@@ -75,6 +76,8 @@ To try the plugin for one session without installing it: `claude --plugin-dir ~/
 ### Claude keeps its own list
 
 There's nothing to do. Every Claude session started inside cmux is told about the plugin, and for any task with 3 or more steps it publishes its plan before it starts, then republishes as items start and finish. Claude runs the update itself, so the list changes at those points, not continuously, and short tasks get no list.
+
+When a session with a list stops to wait on you (a question, approval to push or deploy, a step only you can do), it adds a `You:` item for it, which the board marks with `?`. A `?` item means that session is waiting for your answer in its terminal. Once you answer, the session drops the item.
 
 Each session's list appears on its workspace's row in the cmux sidebar and on the board, grouped under `session <id>`.
 
@@ -165,7 +168,7 @@ Each workspace row in cmux's left sidebar already shows that workspace's checkli
 
 ## How it works
 
-- **Skill `session-todos`** tells the agent to publish its plan with `cmux-session-todos set "[x] ..." "[>] ..." "[ ] ..."` when a task starts, and to republish whenever an item starts or finishes.
+- **Skill `session-todos`** tells the agent to publish its plan with `cmux-session-todos set "[x] ..." "[>] ..." "[ ] ..."` when a task starts, to republish whenever an item starts or finishes, and to add a `"[ ] You: ..."` item before it stops to wait on you.
 - **Slash command `/cmux-todos:open`** opens the board in the cmux Dock, or brings it back after you've closed it.
 - **SessionStart hook** reminds every session started inside cmux that the skill exists. Outside cmux it prints nothing.
 - **`bin/cmux-session-todos`** writes a session's items into cmux's own per-workspace checklist (`cmux todo`), tagged `origin=agent`. They show up wherever cmux shows that checklist: the sidebar row and the workspace todo pane (`cmux todo open`).
