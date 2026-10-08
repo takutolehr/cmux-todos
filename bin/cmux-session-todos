@@ -18,7 +18,8 @@ The personal list lives in $XDG_DATA_HOME/cmux-session-todos/personal.json
 and shows at the top of the board.
 
 Items are written "[ ] pending", "[>] in progress" or "[x] done". A leading
-"- " is allowed; text without a checkbox is pending.
+"- " is allowed; text without a checkbox is pending. An item that starts with
+"You: " is something the session is waiting on the user for; the board marks it.
 """
 
 import argparse
@@ -303,6 +304,7 @@ def cmd_hook_session_start(_args):
     context = (
         "This Claude Code session runs inside cmux, where the user follows every session's TODO list. "
         "For any task with 3 or more steps, use the session-todos skill to publish your list and keep it current. "
+        "Before you end a turn with a question or request for the user, add it to that list as a \"You: ...\" item. "
         "When the user asks you to add something to their own todo list, the same skill covers their personal list."
     )
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}}))
@@ -364,6 +366,8 @@ def cmd_personal(args):
 
 GLYPH = {"completed": "✓", "in-progress": "▶", "pending": "○"}
 COLOR = {"completed": "\x1b[2;32m", "in-progress": "\x1b[33m", "pending": ""}
+WAITING_RE = re.compile(r"^you:\s", re.IGNORECASE)  # a session item waiting on the user
+WAITING_GLYPH, WAITING_COLOR = "?", "\x1b[1;35m"
 BOLD, DIM, CYAN, RED, REVERSE, RESET = "\x1b[1m", "\x1b[2m", "\x1b[36m", "\x1b[31m", "\x1b[7m", "\x1b[0m"
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 BOARD_KEYS = "space done  a add  e edit  d del  s start  ⏎ go  q quit"
@@ -491,8 +495,11 @@ def board_rows(sections, width, hide_done=False, show_empty=False, interactive=F
             visible = [item for item in items if not (hide_done and item["state"] == "completed")]
             for item in visible:
                 state = item["state"]
+                glyph, color = GLYPH.get(state, "○"), COLOR.get(state, "")
+                if state != "completed" and WAITING_RE.match(item["text"]):
+                    glyph, color = WAITING_GLYPH, WAITING_COLOR
                 text = fit(item["text"], width - len(indent) - 4)
-                rows.append(Row(f"{indent}  {COLOR.get(state, '')}{GLYPH.get(state, '○')} {text}{RESET}", ("item", item["id"]), section, item))
+                rows.append(Row(f"{indent}  {color}{glyph} {text}{RESET}", ("item", item["id"]), section, item))
             if len(visible) < len(items):
                 rows.append(Row(f"{indent}  {DIM}{len(items) - len(visible)} done{RESET}"))
         rows.append(Row(""))

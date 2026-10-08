@@ -1,6 +1,6 @@
 ---
 name: session-todos
-description: Publish this session's TODO list to cmux so the user can follow every session's progress from the cmux sidebar and the all-sessions board. Use when running inside cmux (CMUX_WORKSPACE_ID is set) at the start of any task with 3 or more steps, and again whenever an item starts, finishes, or the plan changes. Also use when the user asks you to add something to their own todo list (for example "put emailing my manager on my todos").
+description: Publish this session's TODO list to cmux so the user can follow every session's progress from the cmux sidebar and the all-sessions board. Use when running inside cmux (CMUX_WORKSPACE_ID is set) at the start of any task with 3 or more steps, again whenever an item starts, finishes, or the plan changes, and before you end a turn waiting on the user. Also use when the user asks you to add something to their own todo list (for example "put emailing my manager on my todos").
 allowed-tools: Bash(cmux-session-todos *)
 ---
 
@@ -23,7 +23,20 @@ cmux-session-todos set "[x] Read the existing retry logic" "[>] Add exponential 
 - Once you understand the task: publish the plan before you start editing.
 - When an item starts or finishes: publish again with updated marks. Keep exactly one item `[>]` while you work.
 - When the plan changes: add, drop, or reword items and publish.
+- When you end a turn waiting on the user: add a `You:` item for it and publish before you stop (see below).
 - When the task is finished: publish with every item `[x]`. Leave it there; the next task's list replaces it.
+
+## When you're waiting on the user
+
+When you end a turn with a question or request for the user, add a pending item for it that starts with `You: `. This covers a decision or answer you need, approval before a step such as pushing or deploying, information only they have, and a step only they can do. Phrase it as their action:
+
+```bash
+cmux-session-todos set "[x] Commit the retry fix" "[ ] You: Decide whether to push the branch and update the PR description"
+```
+
+The user scans the board to see which sessions need them. Without this item, a list with every item checked off looks finished while the session is actually waiting. The board marks `You:` items with `?`.
+
+When the user answers, drop the item and list the work their answer led to. If this session hasn't published a list, don't start one only for the question.
 
 ## Writing items
 
