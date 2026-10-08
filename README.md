@@ -88,7 +88,7 @@ Type `/cmux-todos:open` in a Claude session, or ask it to "bring back the todo b
 
 Everything is editable outside the session, and your edits win.
 
-**On the board**, move with `↑`/`↓` (or `j`/`k`) and press:
+**On the board**, move with `↑`/`↓` (or `j`/`k`), jump to the next or previous list heading with `tab`/`shift-tab`, and press:
 
 | Key | Action |
 | --- | --- |

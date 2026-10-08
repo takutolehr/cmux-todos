@@ -636,7 +636,7 @@ class BoardTUI:
         sequence = ""
         while len(sequence) < 2 and select.select([self.fd], [], [], 0.02)[0]:
             sequence += os.read(self.fd, 1).decode(errors="ignore")
-        return {"[A": "up", "OA": "up", "[B": "down", "OB": "down"}.get(sequence)
+        return {"[A": "up", "OA": "up", "[B": "down", "OB": "down", "[Z": "backtab"}.get(sequence)
 
     def prompt(self, label, initial=""):
         """Read a line on the bottom row. Enter accepts; Esc, Ctrl-C or an empty line cancels.
@@ -690,9 +690,24 @@ class BoardTUI:
             self.cursor_index = max(0, min(self.cursor_index + step, len(keys) - 1))
             self.cursor = keys[self.cursor_index]
 
+    def jump_heading(self, step):
+        """Move to the next (step 1) or previous (step -1) list heading, wrapping around."""
+        keys = [row.key for row in self.rows if row.key]
+        headings = [i for i, key in enumerate(keys) if key[0] == "section"]
+        if not headings:
+            return
+        if step > 0:
+            self.cursor_index = next((i for i in headings if i > self.cursor_index), headings[0])
+        else:
+            self.cursor_index = next((i for i in reversed(headings) if i < self.cursor_index), headings[-1])
+        self.cursor = keys[self.cursor_index]
+
     def handle(self, key):
         if key in ("up", "k", "down", "j"):
             self.move(-1 if key in ("up", "k") else 1)
+            return
+        if key in ("\t", "backtab"):
+            self.jump_heading(1 if key == "\t" else -1)
             return
         if key in ("c", "w"):
             if key == "c":
